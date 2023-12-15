@@ -11,11 +11,16 @@ function __init__()
     scratchspace = @get_scratch!("hnc-$(MODULE_VERSION.major).$(MODULE_VERSION.minor)")
 end
 
+using Unitful
+using StaticArrays
+using AtomsBase
+
 include("constants.jl")
 include("lammpstrj_parser.jl")
 include("hypernettedchain.jl")
 include("rdf.jl")
 include("mdft.jl")
 include("viewer.jl")
+include("gridmontecarlo.jl")
 
 end # module MolecularDFT
