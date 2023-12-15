@@ -178,28 +178,35 @@ end
 rdf2tcf(rdf) = rdf ./ mean(rdf[end-div(length(rdf), 10):end]) .- 1
 
 
-function compute_average_self_potential(mol::AbstractSystem, ff::ForceField, range, numrot_hint=175)
-    rots, weights = get_rotation_matrices(mol, numrot_hint)
+function energy_nocutoff(ff::CEG.ForceField, ffidxi, pos1, pos2)
+    energy = 0.0u"K"
+    for (k1, p1) in enumerate(pos1), (k2, p2) in enumerate(pos2)
+        energy += ff[ffidxi[k1], ffidxi[k2]](CEG.norm2(p1, p2))
+    end
+    energy
+end
+
+function compute_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, range, numrot_hint=175)
+    rots, weights = CEG.get_rotation_matrices(mol, numrot_hint)
     numrot = length(rots)
     @assert numrot == length(weights)
     n = length(range)
-    rs = eltype(range) isa Quantity ? range : range * u"Å"
+    rs = eltype(range) <: Quantity ? range : range * u"Å"
     T = eltype(rs)
     poss0 = position(mol)
     molposs = [[SVector{3}(r*p) for p in poss0] for r in rots]
-    model = SimulationStep(ff, [mol], [[poss0, copy(poss0)]], CellMatrix())
+    ffidxi = [ff.sdict[CEG.atomic_symbol(mol, k)]::Int for k in 1:length(mol)]
     vs = Matrix{Float64}(undef, numrot, n)
     v = dropdims(mean(vs; dims=1); dims=1)
     Base.Threads.@threads for i in 1:n
         offset = SVector{3,T}(zero(T), zero(T), rs[i])
         Base.Threads.@threads for j in 1:numrot
             tot = 0.0u"K"
-            system = update_position(model, (1,1), molposs[j])
+            pos1 = molposs[j]
             # energies = Vector{typeof(1.0u"K")}(undef, numrot)
             for (k, weight) in enumerate(weights)
-                update_position!(system, (1,2), molposs[k] .+ (offset,))
-                # energies[k] = energy_nocutoff(system)
-                tot += weight*energy_nocutoff(system)
+                pos2 = molposs[k] .+ (offset,)
+                tot += weight*energy_nocutoff(ff, ffidxi, pos1, pos2)
             end
             # emin_j = minimum(energies)
             # eweight_j = 0.0
@@ -224,13 +231,18 @@ function compute_average_self_potential(mol::AbstractSystem, ff::ForceField, ran
         # v[i] = tot2/(4π)^2/eweight_i
     end
     flag = false
-    for i in n:-1:1 # fill the unphysical part close to 0 with value 1e8
-        if !flag && v[i] > 1e8
+    for i in n:-1:1 # fill the unphysical part close to 0 with value 1e100
+        if !flag && v[i] > 1e100
             flag = true
         end
         if flag
-            v[i] = 1e8
+            v[i] = 1e100
         end
     end
-    eltype(range) isa Quantity ? v*u"K" : v
+    eltype(range) <: Quantity ? v*u"K" : v
+end
+
+function function_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, range, numrot_hint=175)
+    eltype(range) <: Quantity && error("CubicSplineInterpolator does not support units: please ustrip the input")
+    SemiTruncatedInterpolator(range, compute_average_self_potential(mol, ff, range, numrot_hint))
 end
