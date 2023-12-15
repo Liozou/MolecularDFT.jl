@@ -88,14 +88,18 @@ function finaldensity(igp::IdealGasProblem, ψ)
 end
 
 
-struct SemiTruncatedInterpolator
-    f::CubicSplineInterpolator{Float64, NoBoundaries}
-    R::Float64
+struct SemiTruncatedInterpolator{T}
+    f::CubicSplineInterpolator{T, NoBoundaries}
+    R::T
 end
-(f::SemiTruncatedInterpolator)(x) = ((@assert x ≥ 0); x > f.R ? 0.0 : f.f(x))
+(f::SemiTruncatedInterpolator{T})(x) where {T} = ((@assert x ≥ zero(T)); x > f.R ? zero(T) : f.f(x))
 function SemiTruncatedInterpolator(qdht::QDHT, ĉ)
     f = CubicSplineInterpolator(qdht.r, (qdht\ĉ) ./ ((2π)^(3/2)), NoBoundaries())
     SemiTruncatedInterpolator(f, qdht.R)
+end
+function SemiTruncatedInterpolator(x, y)
+    f = CubicSplineInterpolator(x, y, NoBoundaries())
+    SemiTruncatedInterpolator(f, last(x))
 end
 
 
@@ -116,13 +120,13 @@ end
 function expand_correlation(c₂r, (a1, a2, a3)::NTuple{3,Int}, mat)
     δv = det(mat)/(a1*a2*a3)
     invmat = inv(mat)
-    buffer, ortho, safemin = prepare_periodic_distance_computations(mat)
+    buffer, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
     safemin2 = safemin^2
-    buffer2 = MVector{3,Float64}()
+    buffer2 = MVector{3,Float64}(undef)
     c₂ = Array{Float64}(undef, a1, a2, a3)
     for i3 in 1:a3, i2 in 1:a2, i1 in 1:a1
         buffer .= mat[:,1].*((i1-1)/a1) .+ mat[:,2].*((i2-1)/a2) .+ mat[:,3].*((i3-1)/a3)
-        c₂[i1,i2,i3] = δv*c₂r(sqrt(periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)))
+        c₂[i1,i2,i3] = δv*c₂r(sqrt(CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)))
     end
     c₂
 end
@@ -131,7 +135,7 @@ struct MonoAtomic <: MDFTProblem
     igp::IdealGasProblem
     ĉ₂::Array{ComplexF64,3} # ĉ₂(k), Fourier transform of the direct correlation function c₂(r)
     plan::FFTW.rFFTWPlan{Float64, -1, false, 3, NTuple{3,Int}}
-    c₂r::SemiTruncatedInterpolator
+    c₂r::SemiTruncatedInterpolator{Float64}
 end
 
 function MonoAtomic(gasname_or_ρ₀, T::Float64, P::Float64, externalV::Array{Float64,3}, c₂r::SemiTruncatedInterpolator, _mat::AbstractMatrix{Float64})
@@ -211,7 +215,7 @@ struct LinearMolecule <: MDFTProblem
     δv::Float64   # volume of an elementary grid cube, in Å³, derived from externalV and mat
     ĉ₂::Array{ComplexF64,3} # ĉ₂(k), Fourier transform of the direct correlation function c₂(r)
     plan::FFTW.rFFTWPlan{Float64, -1, false, 3, NTuple{3,Int}}
-    c₂r::SemiTruncatedInterpolator
+    c₂r::SemiTruncatedInterpolator{Float64}
 end
 
 function LinearMolecule(gasname_or_ρ₀, T::Float64, P::Float64, externalV::Array{Float64,4}, c₂r::SemiTruncatedInterpolator, _mat::AbstractMatrix{Float64})
@@ -392,7 +396,7 @@ function _isotherm_hnc_igp(_, _, egrid::Array{Float64,3}, temperature, pressures
     isotherm, opts
 end
 
-function _isotherm_hnc(ff::ForceField, mol::AbstractSystem, egrid::Array{Float64,N}, temperature, pressures, mat,
+function _isotherm_hnc(ff::CEG.ForceField, mol::AbstractSystem, egrid::Array{Float64,N}, temperature, pressures, mat,
                       molname::AbstractString, qdht::QDHT{0,2}) where N
     m = length(pressures)
     if iszero(qdht.R)
@@ -426,7 +430,7 @@ function _isotherm_hnc(ff::ForceField, mol::AbstractSystem, egrid::Array{Float64
     isotherm, opts
 end
 
-function isotherm_hnc(ff::ForceField, mol::AbstractSystem, egrid::Array{Float64,N}, temperature, pressures, mat;
+function isotherm_hnc(ff::CEG.ForceField, mol::AbstractSystem, egrid::Array{Float64,N}, temperature, pressures, mat;
                       molname=identify_molecule(atomic_symbol(mol)), qdht=QDHT{0,2}(100, 10000)) where N
     fun = iszero(qdht.R) ? _isotherm_hnc_igp : _isotherm_hnc
     if size(egrid, 1) == 1
