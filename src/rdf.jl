@@ -2,7 +2,7 @@ using Base.Threads
 using LinearAlgebra: isdiag, det
 using Statistics: mean
 import Chemfiles
-
+import BasicInterpolators: LinearInterpolator, CubicSplineInterpolator, NoBoundaries
 
 function compute_angle(posA, posB)
     pos = posB - posA
@@ -186,63 +186,99 @@ function energy_nocutoff(ff::CEG.ForceField, ffidxi, pos1, pos2)
     energy
 end
 
-function compute_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, range, numrot_hint=175)
+function prepare_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, numrot_hint)
     rots, weights = CEG.get_rotation_matrices(mol, numrot_hint)
-    numrot = length(rots)
-    @assert numrot == length(weights)
-    n = length(range)
-    rs = eltype(range) <: Quantity ? range : range * u"Å"
-    T = eltype(rs)
+    @assert length(rots) == length(weights)
     poss0 = position(mol)
     molposs = [[SVector{3}(r*p) for p in poss0] for r in rots]
     ffidxi = [ff.sdict[CEG.atomic_symbol(mol, k)]::Int for k in 1:length(mol)]
-    vs = Matrix{Float64}(undef, numrot, n)
-    v = dropdims(mean(vs; dims=1); dims=1)
+    weights, molposs, ffidxi
+end
+
+function _compute_average_self_potential(molposs, ff::CEG.ForceField, ffidxi, offset, weights, buffer=Vector{typeof(1.0u"K")}(undef, length(weights)))
+    numrot = length(weights)
+    Base.Threads.@threads for j in 1:numrot
+        tot = 0.0u"K"
+        pos1 = molposs[j]
+        for (k, weight) in enumerate(weights)
+            pos2 = molposs[k] .+ (offset,)
+            tot += weight*energy_nocutoff(ff, ffidxi, pos1, pos2)
+        end
+        buffer[j] = tot
+    end
+    tot2 = 0.0u"K"
+    for (j, weight) in enumerate(weights)
+        tot2 += weight*buffer[j]
+    end
+    tot2/(4π)^2
+end
+
+function compute_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, dist::Number, numrot_hint=175)
+    weights, molposs, ffidxi = prepare_average_self_potential(mol, ff, numrot_hint)
+    offset = SA[0.0u"Å", 0.0u"Å", dist isa Quantity ? dist : dist*u"Å"]
+    _compute_average_self_potential(molposs, ff, ffidxi, offset, weights)
+end
+
+
+function compute_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, range, numrot_hint=175)
+    weights, molposs, ffidxi = prepare_average_self_potential(mol, ff, numrot_hint)
+    n = length(range)
+    rs = eltype(range) <: Quantity ? range : range * u"Å"
+    T = eltype(rs)
+    v = Vector{typeof(1.0u"K")}(undef, n)
     Base.Threads.@threads for i in 1:n
         offset = SVector{3,T}(zero(T), zero(T), rs[i])
-        Base.Threads.@threads for j in 1:numrot
-            tot = 0.0u"K"
-            pos1 = molposs[j]
-            # energies = Vector{typeof(1.0u"K")}(undef, numrot)
-            for (k, weight) in enumerate(weights)
-                pos2 = molposs[k] .+ (offset,)
-                tot += weight*energy_nocutoff(ff, ffidxi, pos1, pos2)
-            end
-            # emin_j = minimum(energies)
-            # eweight_j = 0.0
-            # for (k, weight) in enumerate(weights)
-                # x = exp(-NoUnits((energies[k]-emin_j)/temperature))
-                # tot += weight*x*energies[k]
-                # eweight_j += x
-            # end
-            vs[j,i] = NoUnits(tot/u"K")
-            # vs[j,i] = NoUnits(tot/u"K")/eweight_j
-        end
-        tot2 = 0.0
-        # eweight_i = 0.0
-        # emin_i = minimum(@view vs[:,i])
-        for (j, weight) in enumerate(weights)
-            # y = exp(-NoUnits((vs[j,i]-emin_i)/NoUnits(temperature/u"K")))
-            # tot2 += weight*y*vs[j,i]
-            # eweight_i += y
-            tot2 += weight*vs[j,i]
-        end
-        v[i] = tot2/(4π)^2
-        # v[i] = tot2/(4π)^2/eweight_i
+        v[i] = _compute_average_self_potential(molposs, ff, ffidxi, offset, weights)
     end
     flag = false
     for i in n:-1:1 # fill the unphysical part close to 0 with value 1e100
-        if !flag && v[i] > 1e100
+        if !flag && v[i] > 1e100u"K"
             flag = true
         end
         if flag
-            v[i] = 1e100
+            v[i] = 1e100u"K"
         end
     end
-    eltype(range) <: Quantity ? v*u"K" : v
+    eltype(range) <: Quantity ? v : ustrip.(u"K", v)
+end
+
+
+struct IncrementalSmoothInterpolator{T}
+    flow::LinearInterpolator{T, NoBoundaries}
+    mid::T
+    fhigh::CubicSplineInterpolator{T, NoBoundaries}
+    top::T
+end
+function (f::IncrementalSmoothInterpolator{T})(x) where {T}
+    @assert x ≥ zero(T);
+    x > f.top && return zero(T)
+    if x < f.mid
+        return f.flow(x)
+    end
+    return f.fhigh(x)
+end
+
+function IncrementalSmoothInterpolator(x, y)
+    midlimit = 1
+    while y[midlimit] == 1e100
+        midlimit += 1
+    end
+    inflimit = max(1, midlimit-1)
+    λ = x[inflimit]
+    while y[midlimit] > 1e4
+        midlimit += 1
+    end
+    flow = if iszero(λ)
+        LinearInterpolator(x[inflimit:midlimit], y[inflimit:midlimit], NoBoundaries())
+    else
+        LinearInterpolator([-0.0; λ/2; @view x[inflimit:midlimit]], [1e100; 1e100; @view y[inflimit:midlimit]], NoBoundaries())
+    end
+    fhigh = CubicSplineInterpolator(x[midlimit:end], y[midlimit:end], NoBoundaries())
+    IncrementalSmoothInterpolator(flow, x[midlimit], fhigh, last(x))
 end
 
 function function_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField, range, numrot_hint=175)
     eltype(range) <: Quantity && error("CubicSplineInterpolator does not support units: please ustrip the input")
-    SemiTruncatedInterpolator(range, compute_average_self_potential(mol, ff, range, numrot_hint))
+    v = compute_average_self_potential(mol, ff, range, numrot_hint)
+    IncrementalSmoothInterpolator(range, v)
 end
