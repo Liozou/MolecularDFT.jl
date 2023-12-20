@@ -3,11 +3,96 @@ using Unitful: Quantity, ustrip, @u_str
 import Clapeyron
 using Base.Threads: @threads
 
+# Compact sparse array used to represent the interactions between two identical species
+struct CentroSymmetricTensor{T} <: AbstractArray{T,3}
+    data::Vector{T}
+    inds::Matrix{NTuple{3,Int}}
+    default::T
+    size::NTuple{3,Int}
+end
+Base.size(x::CentroSymmetricTensor) = x.size
+Base.@propagate_inbounds function Base.getindex(x::CentroSymmetricTensor, i::Int, j::Int, k::Int)
+    a, b, c = x.size
+    @boundscheck if (i<1)|(j<1)|(k<1)|(i>a)|(j>b)|(k>c)
+        throw(BoundsError(x, (i,j,k)))
+    end
+    dj, dk = size(x.inds)
+    if k > dk
+        k = 1 + (k!=1)*(c+1-k)
+        k > dk && return x.default
+        j = 1 + (j!=1)*(b+1-j)
+        i = 1 + (i!=1)*(a+1-i)
+    end
+    j += dj÷2
+    if j > b
+        j -= b
+    elseif j > dj
+        return x.default
+    end
+    indpos, ofsi, maxi = x.inds[j,k]
+    i += ofsi
+    if i > a
+        i -= a
+    elseif i > maxi
+        return x.default
+    end
+    return x.data[indpos + i]
+end
+
+"""
+    CentroSymmetricTensor(values::AbstractVector{Tuple{Int,<:AbstractVector{Tuple{Int,<:AbstractVector{T}}}}}, (a,b,c)::NTuple{3,Int}, default::T) where T
+
+Return a CentroSymmetricTensor of size `(a,b,c)` and default value `default` representing
+an array `x` of identical size and having a central symmetry, i.e. for all `i`, `j`, `k`,
+`x[1+i,1+j,1+k] == x[a+1-i, b+1-j, c+1-k]`. The symmetry is with respect to `(1,1,1)`.
+
+`values` is made of `dk` pairs `(midj, values_j)` extracted from the initial array `x` of
+size `(a,b,c)`, where `k`-th pair is made of:
+- `midj` is the index of `values_j` that corresponds to a `j` index of 1 in `x`.
+  Indices lower than `midj` in `values_j` correspond to initial indices between `b÷2` and
+  `b`.
+- `values_j` is the list of pairs `(midi, values_i)` such that `values_i` is not empty.
+  Similarly, its `i`-th value is made of:
+  * `midi`, the index of `values_i` that corresponds to a `i` index of 1 in `x`.
+  * `values_i`, the list of values of the initial array such that `values_i[i]` is
+    `x[mod1(i+1-midi), mod1(j+1-midj, b), k]`
+"""
+function CentroSymmetricTensor(values::AbstractVector{<:Tuple{Int,AbstractVector{<:Tuple{Int,AbstractVector{T}}}}}, (a,b,c)::NTuple{3,Int}, default::T) where T
+    dk = length(values)
+    @assert dk ≤ (c+1)÷2
+    djneg = djpos = 0
+    len = 0
+    for (mj, valj) in values
+        @assert 1 ≤ mj ≤ length(valj) ≤ b || mj == length(valj) == 0
+        djneg = max(djneg, mj-1)
+        djpos = max(djpos, length(valj)-mj)
+        for (mi, vali) in valj
+            @assert 1 ≤ mi ≤ length(vali) ≤ a || mi == length(vali) == 0
+            len += length(vali)
+        end
+    end
+    djm = 1 + max(djneg, djpos)
+    dj = 1 + 2*(djm-1)
+    inds = fill((0,0,0), dj, dk)
+    data = Vector{T}(undef, len)
+    idx = 1
+    for k in 1:dk
+        midj, values_j = values[k]
+        for (j, (midi, values_i)) in enumerate(values_j)
+            n = length(values_i)
+            copyto!(data, idx, values_i, 1, n)
+            inds[j-midj+djm,k] = (idx-1, midi-1, length(values_i))
+            idx += n
+        end
+    end
+    CentroSymmetricTensor{T}(data, inds, default, (a,b,c))
+end
+
 struct GridMCSetup{TModel}
     grid::Array{Float64,3}
     positions::Vector{NTuple{3,Int}}
     volume::typeof(1.0u"Å^3")
-    interactions::Array{Float64,3}
+    interactions::CentroSymmetricTensor{Float64}
     moves::CEG.MCMoves
     model::TModel
 end
@@ -29,18 +114,59 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
     num_unitcell = Cint.(CEG.find_supercell(setup.framework, ff.cutoff))
     mat = ustrip.(u"Å", stack(num_unitcell.*bounding_box(setup.framework)))
     interp = function_average_self_potential(setup.molecule, ff, 0.0:(ustrip(u"Å", step)/5):ustrip(u"Å", ff.cutoff))
-    a1, a2, a3 = num_unitcell .* size(egrid)
-    interactions = Array{Float64,3}(undef, a1, a2, a3)
+    a, b, c = num_unitcell .* size(egrid)
+    maxk = ceil(Int, ustrip(u"Å", ff.cutoff)/norm(mat[:,3])*c)
+    interactions_data = Vector{Tuple{Int,Vector{Tuple{Int,Vector{Float64}}}}}(undef, maxk)
     invmat = inv(mat)
-    @threads for i3 in 1:a3
+    cutoff2 = ustrip(u"Å", ff.cutoff)^2
+    @threads for k in 1:maxk
         buffer, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
         safemin2 = safemin^2
         buffer2 = MVector{3,Float64}(undef)
-        for i2 in 1:a2, i1 in 1:a1
-            buffer .= mat[:,1].*((i1-1)/a1) .+ mat[:,2].*((i2-1)/a2) .+ mat[:,3].*((i3-1)/a3)
-            interactions[i1,i2,i3] = interp(sqrt(CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)))
+        last_j = first_j = 0
+        values_j = Tuple{Int,Vector{Float64}}[]
+        for j in 1:b
+            buffer .= mat[:,3].*((k-1)/c) .+ mat[:,2].*((j-1)/b)
+            col = SVector{3,Float64}(buffer)
+            startdist = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
+            if last_j == 0 && startdist ≥ cutoff2
+                last_j = j-1
+            elseif last_j != 0 && first_j == 0 && startdist < cutoff2
+                first_j = j
+            end
+            if startdist < cutoff2
+                @assert last_j == 0 || first_j != 0
+            else
+                @assert last_j != 0 && first_j == 0
+            end
+            startdist < cutoff2 || continue
+            values_i = Float64[]
+            last_i = first_i = 0
+            for i in 1:a
+                buffer .= col .+ mat[:,1].*((i-1)/a)
+                dist2 = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
+                if last_i == 0 && dist2 ≥ cutoff2
+                    last_i = i-1
+                elseif last_i != 0 && first_i == 0 && dist2 < cutoff2
+                    first_i = i
+                end
+                if dist2 < cutoff2
+                    @assert last_i == 0 || first_i != 0
+                else
+                    @assert last_i != 0 && first_i == 0
+                end
+                dist2 < cutoff2 || continue
+                push!(values_i, interp(sqrt(dist2)))
+            end
+            circshift!(values_i, -last_i)
+            midi = first_i ≤ 1 ? 1 : a + 2 - first_i
+            push!(values_j, (midi, values_i))
         end
+        circshift!(values_j, -last_j)
+        midj = first_j ≤ 1 ? 1 : b + 2 - first_j
+        interactions_data[k] = (midj, values_j)
     end
+    interactions = CentroSymmetricTensor(interactions_data, (a,b,c), 0.0)
     cmoves = moves isa Nothing ? CEG.MCMoves(length(setup.molecule) == 1) : moves
     GridMCSetup(egrid, mat*u"Å", interactions, cmoves, gasname)
 end
@@ -235,6 +361,10 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
             accepted = compute_accept_move(Number(diff), temperature)
             if accepted
+                if Float64(diff) ≥ 1e100
+                    @show Number(diff)
+                    error("$idx, $newpos")
+                end
                 gmc.positions[idx] = newpos
                 CEG.accept!(statistics, move)
                 if abs(Number(diff)) > 1e50u"K" # an atom left a blocked pocket
