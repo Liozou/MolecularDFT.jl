@@ -88,32 +88,37 @@ function CentroSymmetricTensor(values::AbstractVector{<:Tuple{Int,AbstractVector
     CentroSymmetricTensor{T}(data, inds, default, (a,b,c))
 end
 
-struct GridMCSetup{TModel}
+
+struct GridMCSetup{TModel0,TModel}
     grid::Array{Float64,3}
     positions::Vector{NTuple{3,Int}}
     volume::typeof(1.0u"Å^3")
     interactions::CentroSymmetricTensor{Float64}
     moves::CEG.MCMoves
+    model0::TModel0
     model::TModel
+    input::NTuple{4,String}
+    num_unitcell::NTuple{3,Int}
 end
-function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, moves::CEG.MCMoves, gasname::AbstractString, positions=NTuple{3,Int}[])
+function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, moves::CEG.MCMoves, gasname::AbstractString, input::Tuple, num_unitcell::NTuple{3,Int}, positions=NTuple{3,Int}[])
     gaskey = get(GAS_NAMES, gasname, gasname)
     accessible_fraction = count(<(1e100), grid) / length(grid)
     volume = accessible_fraction * prod(CEG.cell_lengths(mat))
-    GridMCSetup(grid, positions, volume, interactions, moves, Clapeyron.GERG2008([gaskey]))
+    GridMCSetup(grid, positions, volume, interactions, moves, Clapeyron.PR([gaskey]), Clapeyron.GERG2008([gaskey]), input, num_unitcell)
 end
 
 function Base.copy(gmc::GridMCSetup)
-    GridMCSetup(gmc.grid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model)
+    GridMCSetup(gmc.grid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.input, gmc.num_unitcell)
 end
 
 function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
     setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
-    egrid = dropdims(mean(CEG.energy_grid(setup, step); dims=1); dims=1)
     ff = setup.forcefield
-    num_unitcell = Cint.(CEG.find_supercell(setup.framework, ff.cutoff))
+    ff_∞ = CEG.parse_forcefield_RASPA(forcefield; cutoff=Inf*u"Å")
+    interp = function_average_self_potential(setup.molecule, ff_∞, 0.0:(ustrip(u"Å", step)/5):ustrip(u"Å", ff.cutoff))
+    egrid = dropdims(mean(CEG.energy_grid(setup, step); dims=1); dims=1)
+    num_unitcell = CEG.find_supercell(setup.framework, ff.cutoff)
     mat = ustrip.(u"Å", stack(num_unitcell.*bounding_box(setup.framework)))
-    interp = function_average_self_potential(setup.molecule, ff, 0.0:(ustrip(u"Å", step)/5):ustrip(u"Å", ff.cutoff))
     a, b, c = num_unitcell .* size(egrid)
     maxk = ceil(Int, ustrip(u"Å", ff.cutoff)/norm(mat[:,3])*c)
     interactions_data = Vector{Tuple{Int,Vector{Tuple{Int,Vector{Float64}}}}}(undef, maxk)
@@ -167,8 +172,9 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
         interactions_data[k] = (midj, values_j)
     end
     interactions = CentroSymmetricTensor(interactions_data, (a,b,c), 0.0)
-    cmoves = moves isa Nothing ? CEG.MCMoves(length(setup.molecule) == 1) : moves
-    GridMCSetup(egrid, mat*u"Å", interactions, cmoves, gasname)
+    cmoves = moves isa Nothing ? CEG.MCMoves(true) : moves
+    input = (framework::AbstractString, forcefield, gasname, mol_ff)
+    GridMCSetup(egrid, mat*u"Å", interactions, cmoves, gasname, input, num_unitcell)
 end
 
 
@@ -331,14 +337,21 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
     P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
     PV_div_k = uconvert(u"K", P*gmc.volume/u"k")
-    φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, first(simu.temperatures)))
-    isnan(φ) && error("Specified gas not in gas form at the required temperature and pressure!")
+    T0 = first(simu.temperatures)
+    φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, T0; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, T0)))
+    isnan(φ) && error("Specified gas not in gas form at the required temperature ($(first(simu.temperatures))) and pressure ($P)!")
     constantT = allequal(simu.temperatures)
+
+    Π = prod(gmc.num_unitcell)
 
     for (counter_cycle, idx_cycle) in enumerate((-simu.ninit+1):simu.ncycles)
         temperature = simu.temperatures[counter_cycle]
 
-        φPV_div_k = (constantT ? φ : Clapeyron.fugacity_coefficient!(φ, gmc.model, P, temperature))*PV_div_k
+        φPV_div_k = if constantT
+            φ
+        else
+            Clapeyron.fugacity_coefficient!(φ, gmc.model, P, temperature; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, temperature))
+        end*PV_div_k
         swap_statistics_update, energy_update = perform_swaps!(gmc, temperature, φPV_div_k)
         swap_statistics .+= swap_statistics_update
         energy += energy_update
@@ -408,7 +421,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
         println(io, " - accepted deletion", swap_statistics[3]>1 ? "s: " : ": ", swap_statistics[3], '/', swap_statistics[4], " (attempted) = ", swap_statistics[3]/swap_statistics[4])
         println(io)
     end
-    energies, Ns
+    energies, Ns./Π
 end
 
 function make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
