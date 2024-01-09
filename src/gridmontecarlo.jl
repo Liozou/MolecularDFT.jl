@@ -88,9 +88,8 @@ function CentroSymmetricTensor(values::AbstractVector{<:Tuple{Int,AbstractVector
     CentroSymmetricTensor{T}(data, inds, default, (a,b,c))
 end
 
-
 struct GridMCSetup{TModel0,TModel}
-    grid::Array{Float64,3}
+    egrid::Array{Float64,4}
     positions::Vector{NTuple{3,Int}}
     volume::typeof(1.0u"Å^3")
     interactions::CentroSymmetricTensor{Float64}
@@ -108,18 +107,19 @@ function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions,
 end
 
 function Base.copy(gmc::GridMCSetup)
-    GridMCSetup(gmc.grid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.input, gmc.num_unitcell)
+    GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.input, gmc.num_unitcell)
 end
 
 function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
     setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
+    egrid = CEG.energy_grid(setup, step)
+    # min_angle = findmin(eachslice(egrid; dims=(2,3)))
     ff = setup.forcefield
     ff_∞ = CEG.parse_forcefield_RASPA(forcefield; cutoff=Inf*u"Å")
     interp = function_average_self_potential(setup.molecule, ff_∞, 0.0:(ustrip(u"Å", step)/5):ustrip(u"Å", ff.cutoff))
-    egrid = dropdims(mean(CEG.energy_grid(setup, step); dims=1); dims=1)
     num_unitcell = CEG.find_supercell(setup.framework, ff.cutoff)
     mat = ustrip.(u"Å", stack(num_unitcell.*bounding_box(setup.framework)))
-    a, b, c = num_unitcell .* size(egrid)
+    a, b, c = num_unitcell .* size(egrid)[2:end]
     maxk = ceil(Int, ustrip(u"Å", ff.cutoff)/norm(mat[:,3])*c)
     interactions_data = Vector{Tuple{Int,Vector{Tuple{Int,Vector{Float64}}}}}(undef, maxk)
     invmat = inv(mat)
@@ -195,6 +195,7 @@ for op in (:+, :-)
         end
     end
 end
+Base.:/(x::GridMCEnergyReport, n::Integer) = GridMCEnergyReport(x.framework/n, x.interaction/n)
 
 
 function interaction_energy(gmc::GridMCSetup, (i1,j1,k1)::NTuple{3,Int}, (i2,j2,k2)::NTuple{3,Int})
@@ -202,24 +203,24 @@ function interaction_energy(gmc::GridMCSetup, (i1,j1,k1)::NTuple{3,Int}, (i2,j2,
     gmc.interactions[mod1(i1-i2, a), mod1(j1-j2, b), mod1(k1-k2, c)]
 end
 
-function all_interactions(gmc::GridMCSetup, l::Int, pos::NTuple{3,Int})
+function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos::NTuple{3,Int})
     energy = 0.0
     for (idx, other) in enumerate(gmc.positions)
         idx == l && continue
         energy += interaction_energy(gmc, pos, other)
     end
     i,j,k = pos
-    a,b,c = size(gmc.grid)
-    GridMCEnergyReport(gmc.grid[mod1(i,a),mod1(j,b),mod1(k,c)]*u"K", energy*u"K")
+    a,b,c = size(grid)
+    GridMCEnergyReport(grid[mod1(i,a),mod1(j,b),mod1(k,c)]*u"K", energy*u"K")
 end
-all_interactions(gmc::GridMCSetup, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, 0, insertion_pos)
+all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, grid, 0, insertion_pos)
 
-function baseline_energy(gmc::GridMCSetup)
+function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3})
     framework = 0.0
     energy = 0.0
-    a,b,c = size(gmc.grid)
+    a,b,c = size(grid)
     for (l1, (i1,j1,k1)) in enumerate(gmc.positions)
-        framework += gmc.grid[mod1(i1,a),mod1(j1,b),mod1(k1,c)]
+        framework += grid[mod1(i1,a),mod1(j1,b),mod1(k1,c)]
         for l2 in (l1+1):length(gmc.positions)
             energy += interaction_energy(gmc, (i1,j1,k1), gmc.positions[l2])
         end
@@ -227,7 +228,7 @@ function baseline_energy(gmc::GridMCSetup)
     GridMCEnergyReport(framework*u"K", energy*u"K")
 end
 
-function choose_newpos!(statistics, gmc::GridMCSetup, idx)
+function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, idx)
     if idx isa Nothing
         movekind = :random_translation
     else
@@ -236,7 +237,7 @@ function choose_newpos!(statistics, gmc::GridMCSetup, idx)
         CEG.attempt!(statistics, movekind)
         x, y, z = gmc.positions[idx]
     end
-    a, b, c = size(gmc.grid)
+    a, b, c = size(grid)
     α, β, γ = size(gmc.interactions)
     for _ in 1:100
         u, v, w = newpos = if movekind === :translation
@@ -246,7 +247,7 @@ function choose_newpos!(statistics, gmc::GridMCSetup, idx)
         else
             error(lazy"Unknown move kind: $movekind")
         end
-        if gmc.grid[mod1(u,a),mod1(v,b),mod1(w,c)] < 1e100
+        if grid[mod1(u,a),mod1(v,b),mod1(w,c)] < 1e100
             return newpos, movekind, false
         end
     end
@@ -254,7 +255,7 @@ function choose_newpos!(statistics, gmc::GridMCSetup, idx)
     return pos, movekind, true # signal that the move was blocked
 end
 
-choose_newpos(gmc::GridMCSetup) = choose_newpos!(nothing, gmc, nothing)
+choose_newpos(gmc::GridMCSetup, grid::Array{Float64,3}) = choose_newpos!(nothing, gmc, grid, nothing)
 
 function compute_accept_move(diff, T)
     diff < zero(diff) && return true
@@ -270,7 +271,7 @@ function compute_accept_move(diff, temperature, φPV_div_k, N, isinsertion::Bool
     end
 end
 
-function perform_swaps!(gmc, temperature, φPV_div_k)
+function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, φPV_div_k)
     idx_delete = 0
     insertion_pos = (0,0,0)
     insertion_successes = insertion_attempts = 0
@@ -281,13 +282,13 @@ function perform_swaps!(gmc, temperature, φPV_div_k)
         isinsertion = N == 0 ? true : rand(Bool)
         diff_swap = if isinsertion
             insertion_attempts += 1
-            insertion_pos, _, blocked_insertion = choose_newpos(gmc)
+            insertion_pos, _, blocked_insertion = choose_newpos(gmc, grid)
             blocked_insertion && continue
-            all_interactions(gmc, insertion_pos)
+            all_interactions(gmc, grid, insertion_pos)
         else # deletion
             deletion_attempts += 1
             idx_delete = rand(1:N)
-            -all_interactions(gmc, idx_delete, gmc.positions[idx_delete])
+            -all_interactions(gmc, grid, idx_delete, gmc.positions[idx_delete])
         end
         if compute_accept_move(Number(diff_swap), temperature, φPV_div_k, N, isinsertion)
             newenergy += diff_swap
@@ -309,8 +310,15 @@ end
 
 function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressure)
     time_begin = time()
+
+    @assert allequal(simu.temperatures)
+    T0 = first(simu.temperatures)
+    grid = CEG.meanBoltzmann(gmc.egrid, ustrip(u"K", T0))
+    # grid = dropdims(minimum(gmc.egrid; dims=1); dims=1)
+    # TODO: decide whether to keep Boltzmann or minimum
+
     # energy initialization
-    energy = baseline_energy(gmc)
+    energy = baseline_energy(gmc, grid)
     if isinf(Float64(energy)) || isnan(Float64(energy))
         @error "Initial energy is not finite, this probably indicates a problem with the initial configuration."
     end
@@ -337,22 +345,21 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
     P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
     PV_div_k = uconvert(u"K", P*gmc.volume/u"k")
-    T0 = first(simu.temperatures)
     φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, T0; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, T0)))
     isnan(φ) && error("Specified gas not in gas form at the required temperature ($(first(simu.temperatures))) and pressure ($P)!")
-    constantT = allequal(simu.temperatures)
+    φPV_div_k = φ*PV_div_k
 
     Π = prod(gmc.num_unitcell)
 
     for (counter_cycle, idx_cycle) in enumerate((-simu.ninit+1):simu.ncycles)
         temperature = simu.temperatures[counter_cycle]
 
-        φPV_div_k = if constantT
-            φ
-        else
-            Clapeyron.fugacity_coefficient!(φ, gmc.model, P, temperature; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, temperature))
-        end*PV_div_k
-        swap_statistics_update, energy_update = perform_swaps!(gmc, temperature, φPV_div_k)
+        # φPV_div_k = if constantT
+        #     φ
+        # else
+        #     Clapeyron.fugacity_coefficient!(φ, gmc.model, P, temperature; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, temperature))
+        # end*PV_div_k
+        swap_statistics_update, energy_update = perform_swaps!(gmc, grid, temperature, φPV_div_k)
         swap_statistics .+= swap_statistics_update
         energy += energy_update
 
@@ -363,14 +370,14 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
             idx = rand(1:nummol)
 
             # newpos is the position after the trial move
-            newpos, move, blocked = choose_newpos!(statistics, gmc, idx)
+            newpos, move, blocked = choose_newpos!(statistics, gmc, grid, idx)
 
             # If, despite the multiple attempts, the move is blocked, skip early to the
             # next iteration.
             # The refused move is still taken into account in the statistics.
             blocked && continue
 
-            diff = all_interactions(gmc, idx, newpos) - all_interactions(gmc, idx, gmc.positions[idx])
+            diff = all_interactions(gmc, grid, idx, newpos) - all_interactions(gmc, grid, idx, gmc.positions[idx])
 
             accepted = compute_accept_move(Number(diff), temperature)
             if accepted
@@ -381,7 +388,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
                 gmc.positions[idx] = newpos
                 CEG.accept!(statistics, move)
                 if abs(Number(diff)) > 1e50u"K" # an atom left a blocked pocket
-                    energy = baseline_energy(gmc) # to avoid underflows
+                    energy = baseline_energy(gmc, grid) # to avoid underflows
                 else
                     energy += diff
                 end
@@ -393,7 +400,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
                      (idx_cycle < 0 && has_initial_output && (simu.printevery == 0 || (simu.printevery > 0 && idx_cycle%simu.printevery == 0)))
         if !(simu.record isa Returns) || report_now
             if idx_cycle == 0 # start production with a precise energy
-                energy = baseline_energy(gmc)
+                energy = baseline_energy(gmc, grid)
             end
             if report_now
                 if idx_cycle < 0
@@ -427,13 +434,15 @@ end
 function make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
     n = length(pressures)
     isotherm = Vector{Float64}(undef, n)
+    energies = Vector{GridMCEnergyReport}(undef, n)
     @threads for i in 1:n
         newgmc = copy(gmc)
         pressure = pressures[i]
-        _, Ns = run_grid_montecarlo!(newgmc, simu, pressure)
+        es, Ns = run_grid_montecarlo!(newgmc, simu, pressure)
         isotherm[i] = mean(Ns)
+        energies[i] = mean(es)
     end
-    isotherm
+    isotherm, energies
 end
 
 # using Statistics: std
