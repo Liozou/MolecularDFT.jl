@@ -178,6 +178,54 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
 end
 
 
+function CEG.ProtoSimulationStep(gmc::GridMCSetup)
+    # GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
+    ff = CEG.parse_forcefield_RASPA(gmc.input[2])
+    framework = CEG.load_framework_RASPA(gmc.input[1], gmc.input[2])
+    molecule = CEG.load_molecule_RASPA(gmc.input[3], gmc.input[4], gmc.input[2], framework)
+    rots, _ = CEG.get_rotation_matrices(molecule, 40)
+    @assert length(rots) == size(gmc.egrid, 1)
+
+    refpos = position(molecule)::Vector{SVector{3,typeof(1.0u"Å")}}
+    m = length(molecule)
+    n = length(gmc.positions)
+
+    mat = uconvert.(u"Å", stack(gmc.num_unitcell.*bounding_box(framework)))
+
+    charges = fill(NaN*oneunit(molecule.atomic_charge[1]), length(ff.sdict))
+    atoms = [(1,j,k) for j in 1:n for k in 1:m]
+    ffidx = [[ff.sdict[molecule.atomic_symbol[k]::Symbol] for k in 1:m]]
+    for k in 1:m
+        ix = ffidx[1][k]
+        if isnan(charges[ix])
+            charges[ix] = molecule.atomic_charge[k]
+        else
+            @assert charges[ix] == molecule.atomic_charge[k]
+        end
+    end
+
+    _, _a, _b, _c = size(gmc.egrid)
+    a, b, c = gmc.num_unitcell .* (_a, _b, _c)
+    positions = Vector{SVector{3,typeof(1.0u"Å")}}(undef, n*m)
+    buffer = MVector{3,typeof(1.0u"Å")}(undef)
+    ofs = MVector{3,typeof(1.0u"Å")}(undef)
+    for idx in 1:n
+        i, j, k = gmc.positions[idx]
+        ofs .= (@view mat[:,1]).*((i-1)/a) .+ (@view mat[:,2]).*((j-1)/b) .+ (@view mat[:,3]).*((k-1)/c)
+        l = (idx-1)*m
+        rot = rots[findmin(@view gmc.egrid[:, mod1(i, _a), mod1(j, _b), mod1(k, _c)])[2]]
+        for p in refpos
+            l += 1
+            mul!(buffer, rot, p)
+            buffer .+= ofs
+            positions[l] = SVector{3}(buffer)
+        end
+    end
+
+    CEG.ProtoSimulationStep(ff, charges, mat, positions, true, atoms, trues(1), ffidx)
+end
+
+
 # Energy computation
 
 struct GridMCEnergyReport
