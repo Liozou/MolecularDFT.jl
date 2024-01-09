@@ -200,8 +200,9 @@ function _compute_average_self_potential(molposs, ff::CEG.ForceField, ffidxi, of
     Base.Threads.@threads for j in 1:numrot
         tot = 0.0u"K"
         pos1 = molposs[j]
+        pos2 = similar(pos1)
         for (k, weight) in enumerate(weights)
-            pos2 = molposs[k] .+ (offset,)
+            pos2 .= molposs[k] .+ (offset,)
             tot += weight*energy_nocutoff(ff, ffidxi, pos1, pos2)
         end
         buffer[j] = tot
@@ -242,7 +243,14 @@ function compute_average_self_potential(mol::AbstractSystem, ff::CEG.ForceField,
     eltype(range) <: Quantity ? v : ustrip.(u"K", v)
 end
 
+"""
+    IncrementalSmoothInterpolator{T}
 
+Interpolator divided in three regions:
+- a linear interpolation region while values are above 1e4
+- a constant region equal to zero above the last entry point
+- a cubic spline interpolator in between
+"""
 struct IncrementalSmoothInterpolator{T}
     flow::LinearInterpolator{T, NoBoundaries}
     mid::T
