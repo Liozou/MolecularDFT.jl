@@ -248,7 +248,7 @@ Base.:/(x::GridMCEnergyReport, n::Integer) = GridMCEnergyReport(x.framework/n, x
 
 function interaction_energy(gmc::GridMCSetup, (i1,j1,k1)::NTuple{3,Int}, (i2,j2,k2)::NTuple{3,Int})
     a, b, c = size(gmc.interactions)
-    gmc.interactions[mod1(i1-i2, a), mod1(j1-j2, b), mod1(k1-k2, c)]
+    gmc.interactions[mod1(1+i1-i2, a), mod1(1+j1-j2, b), mod1(1+k1-k2, c)]
 end
 
 function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos::NTuple{3,Int})
