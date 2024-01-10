@@ -2,6 +2,7 @@ import CrystalEnergyGrids as CEG
 using Unitful: Quantity, ustrip, @u_str
 import Clapeyron
 using Base.Threads: @threads
+using LinearAlgebra: det, norm
 
 # Compact sparse array used to represent the interactions between two identical species
 struct CentroSymmetricTensor{T} <: AbstractArray{T,3}
@@ -88,42 +89,53 @@ function CentroSymmetricTensor(values::AbstractVector{<:Tuple{Int,AbstractVector
     CentroSymmetricTensor{T}(data, inds, default, (a,b,c))
 end
 
-struct GridMCSetup{TModel0,TModel}
-    egrid::Array{Float64,4}
-    positions::Vector{NTuple{3,Int}}
-    volume::typeof(1.0u"Å^3")
-    interactions::CentroSymmetricTensor{Float64}
-    moves::CEG.MCMoves
-    model0::TModel0
-    model::TModel
-    input::NTuple{4,String}
-    num_unitcell::NTuple{3,Int}
-end
-function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, moves::CEG.MCMoves, gasname::AbstractString, input::Tuple, num_unitcell::NTuple{3,Int}, positions=NTuple{3,Int}[])
-    gaskey = get(GAS_NAMES, gasname, gasname)
-    accessible_fraction = count(<(1e100), grid) / length(grid)
-    volume = accessible_fraction * prod(CEG.cell_lengths(mat))
-    GridMCSetup(grid, positions, volume, interactions, moves, Clapeyron.PR([gaskey]), Clapeyron.GERG2008([gaskey]), input, num_unitcell)
+"""
+    precompute_tailcorrection(setup::CEG.CrystalEnergySetup, ff::CEG.ForceField, mat, Π::Int)
+
+Return a couple of tail corrections `(t1, t2)` such that a system made of `n` molecules has
+an energy tail correction of `n * t1 + n^2 * t2`
+
+In other words, adding a molecule to a system of `m` molecules results in an additional
+tail correction of `t1 + (2m+1)*t2`.
+"""
+function precompute_tailcorrection(setup::CEG.CrystalEnergySetup, ff::CEG.ForceField, mat, Π::Int)
+    n = length(ff.sdict)
+    framework_atoms = zeros(Int, n)
+    for at in setup.framework
+        framework_atoms[ff.sdict[Symbol(CEG.get_atom_name(atomic_symbol(at)))]] += Π
+    end
+    m = length(setup.molecule)
+    molecule_atoms = zeros(Int, n)
+    for k in 1:m
+        ix = ff.sdict[atomic_symbol(setup.molecule, k)::Symbol]
+        molecule_atoms[ix] += 1
+    end
+    framework_tcorrection = 0.0u"K"
+    self_tcorrection = 0.0u"K"
+    for (i, ni) in enumerate(molecule_atoms)
+        ni == 0 && continue
+        for (j, nj) in enumerate(framework_atoms)
+            nj == 0 && continue
+            framework_tcorrection += ni*nj*CEG.tailcorrection(ff[i,j], ff.cutoff)
+        end
+        for (k, nk) in enumerate(molecule_atoms)
+            nk == 0 && continue
+            self_tcorrection += ni*nk*CEG.tailcorrection(ff[i,k], ff.cutoff)
+        end
+        # note: there is double counting, but apparently that's how RASPA does it.
+    end
+    λ = 2π/det(mat)
+    (2λ*framework_tcorrection, λ*self_tcorrection)
 end
 
-function Base.copy(gmc::GridMCSetup)
-    GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.input, gmc.num_unitcell)
-end
-
-function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
-    setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
-    egrid = CEG.energy_grid(setup, step)
-    # min_angle = findmin(eachslice(egrid; dims=(2,3)))
-    ff = setup.forcefield
-    ff_∞ = CEG.parse_forcefield_RASPA(forcefield; cutoff=Inf*u"Å")
-    interp = function_average_self_potential(setup.molecule, ff_∞, 0.0:(ustrip(u"Å", step)/5):ustrip(u"Å", ff.cutoff))
-    num_unitcell = CEG.find_supercell(setup.framework, ff.cutoff)
-    mat = ustrip.(u"Å", stack(num_unitcell.*bounding_box(setup.framework)))
-    a, b, c = num_unitcell .* size(egrid)[2:end]
-    maxk = ceil(Int, ustrip(u"Å", ff.cutoff)/norm(mat[:,3])*c)
+function precompute_interactions(setup::CEG.CrystalEnergySetup, ff_∞::CEG.ForceField, cutoff::Float64, mat, (a,b,c))
+    la, lb, lc = norm.(eachcol(mat))
+    interp = function_average_self_potential(setup.molecule, ff_∞, 0.0:((la+lb+lc)/(5*(a+b+c))):cutoff)
+    maxk = ceil(Int, cutoff*c/lc)
     interactions_data = Vector{Tuple{Int,Vector{Tuple{Int,Vector{Float64}}}}}(undef, maxk)
     invmat = inv(mat)
-    cutoff2 = ustrip(u"Å", ff.cutoff)^2
+    cutoff2 = cutoff^2
+
     @threads for k in 1:maxk
         buffer, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
         safemin2 = safemin^2
@@ -171,10 +183,50 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
         midj = first_j ≤ 1 ? 1 : b + 2 - first_j
         interactions_data[k] = (midj, values_j)
     end
-    interactions = CentroSymmetricTensor(interactions_data, (a,b,c), 0.0)
+    CentroSymmetricTensor(interactions_data, (a,b,c), 0.0)
+end
+
+struct GridMCSetup{TModel0,TModel,TInteractions}
+    egrid::Array{Float64,4}
+    positions::Vector{NTuple{3,Int}}
+    volume::typeof(1.0u"Å^3")
+    interactions::TInteractions # TODO: replace by the final chosen type, no need to keep a parameter here
+    moves::CEG.MCMoves
+    model0::TModel0
+    model::TModel
+    tailcorrection::NTuple{2,typeof(1.0u"K")} # (amount to add for each additional molecule, amount to add after multiplying by the number of molecules)
+    input::NTuple{4,String}
+    num_unitcell::NTuple{3,Int}
+end
+function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, moves::CEG.MCMoves, tailcorrection::NTuple{2,typeof(1.0u"K")}, gasname::AbstractString, input::Tuple, num_unitcell::NTuple{3,Int}, positions=NTuple{3,Int}[])
+    gaskey = get(GAS_NAMES, gasname, gasname)
+    accessible_fraction = count(<(1e100), grid) / length(grid)
+    volume = accessible_fraction * prod(CEG.cell_lengths(mat))
+    GridMCSetup(grid, positions, volume, interactions, moves, Clapeyron.PR([gaskey]), Clapeyron.GERG2008([gaskey]), tailcorrection, input, num_unitcell)
+end
+
+function Base.copy(gmc::GridMCSetup)
+    GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.tailcorrection, gmc.input, gmc.num_unitcell)
+end
+
+function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
+    setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
+    egrid = CEG.energy_grid(setup, step)
+    # min_angle = findmin(eachslice(egrid; dims=(2,3)))
+    ff = setup.forcefield
+    ff_∞ = CEG.parse_forcefield_RASPA(forcefield; cutoff=Inf*u"Å")
+
+    num_unitcell = CEG.find_supercell(setup.framework, ff.cutoff)
+    mat = SMatrix{3,3,Float64,9}(ustrip.(u"Å", stack(num_unitcell.*bounding_box(setup.framework))))
+
+    tailcorrection = precompute_tailcorrection(setup, ff, mat, prod(num_unitcell))
+
+    abc = num_unitcell .* size(egrid)[2:end]
+    interactions = precompute_interactions(setup, ff_∞, ustrip(u"Å", ff.cutoff), mat, abc)
+
     cmoves = moves isa Nothing ? CEG.MCMoves(true) : moves
     input = (framework::AbstractString, forcefield, gasname, mol_ff)
-    GridMCSetup(egrid, mat*u"Å", interactions, cmoves, gasname, input, num_unitcell)
+    GridMCSetup(egrid, mat*u"Å", interactions, cmoves, tailcorrection, gasname, input, num_unitcell)
 end
 
 
@@ -194,9 +246,9 @@ function CEG.ProtoSimulationStep(gmc::GridMCSetup)
 
     charges = fill(NaN*oneunit(molecule.atomic_charge[1]), length(ff.sdict))
     atoms = [(1,j,k) for j in 1:n for k in 1:m]
-    ffidx = [[ff.sdict[molecule.atomic_symbol[k]::Symbol] for k in 1:m]]
+    ffidxi = [ff.sdict[molecule.atomic_symbol[k]::Symbol] for k in 1:m]
     for k in 1:m
-        ix = ffidx[1][k]
+        ix = ffidxi[k]
         if isnan(charges[ix])
             charges[ix] = molecule.atomic_charge[k]
         else
@@ -222,7 +274,7 @@ function CEG.ProtoSimulationStep(gmc::GridMCSetup)
         end
     end
 
-    CEG.ProtoSimulationStep(ff, charges, mat, positions, true, atoms, trues(1), ffidx)
+    CEG.ProtoSimulationStep(ff, charges, mat, positions, true, atoms, trues(1), [ffidxi])
 end
 
 
@@ -231,19 +283,20 @@ end
 struct GridMCEnergyReport
     framework::typeof(1.0u"K")
     interaction::typeof(1.0u"K")
+    tailcorrection::typeof(1.0u"K")
 end
-GridMCEnergyReport() = GridMCEnergyReport(0.0u"K", 0.0u"K")
-Base.Number(x::GridMCEnergyReport) = x.framework + x.interaction
+GridMCEnergyReport() = GridMCEnergyReport(0.0u"K", 0.0u"K", 0.0u"K")
+Base.Number(x::GridMCEnergyReport) = x.framework + x.interaction + x.tailcorrection
 Base.Float64(x::GridMCEnergyReport) = ustrip(u"K", Number(x))
 for op in (:+, :-)
     @eval begin
-        Base.$op(x::GridMCEnergyReport) = GridMCEnergyReport($op(x.framework), $op(x.interaction))
+        Base.$op(x::GridMCEnergyReport) = GridMCEnergyReport($op(x.framework), $op(x.interaction), $op(x.tailcorrection))
         function Base.$op(x::GridMCEnergyReport, y::GridMCEnergyReport)
-            GridMCEnergyReport($op(x.framework, y.framework), $op(x.interaction, y.interaction))
+            GridMCEnergyReport($op(x.framework, y.framework), $op(x.interaction, y.interaction), $op(x.tailcorrection, y.tailcorrection))
         end
     end
 end
-Base.:/(x::GridMCEnergyReport, n::Integer) = GridMCEnergyReport(x.framework/n, x.interaction/n)
+Base.:/(x::GridMCEnergyReport, n::Integer) = GridMCEnergyReport(x.framework/n, x.interaction/n, x.tailcorrection/n)
 
 
 function interaction_energy(gmc::GridMCSetup, (i1,j1,k1)::NTuple{3,Int}, (i2,j2,k2)::NTuple{3,Int})
@@ -259,7 +312,9 @@ function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos:
     end
     i,j,k = pos
     a,b,c = size(grid)
-    GridMCEnergyReport(grid[mod1(i,a),mod1(j,b),mod1(k,c)]*u"K", energy*u"K")
+    n = length(gmc.positions) - (l!=0)
+    tailcorrection = gmc.tailcorrection[1] + gmc.tailcorrection[2]*(2n+1)
+    GridMCEnergyReport(grid[mod1(i,a),mod1(j,b),mod1(k,c)]*u"K", energy*u"K", tailcorrection)
 end
 all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, grid, 0, insertion_pos)
 
@@ -273,7 +328,9 @@ function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3})
             energy += interaction_energy(gmc, (i1,j1,k1), gmc.positions[l2])
         end
     end
-    GridMCEnergyReport(framework*u"K", energy*u"K")
+    n = length(gmc.positions)
+    tailcorrection = n*(gmc.tailcorrection[1] + n*gmc.tailcorrection[2])
+    GridMCEnergyReport(framework*u"K", energy*u"K", tailcorrection)
 end
 
 function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, idx)
@@ -376,6 +433,11 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
     has_initial_output = any(startswith("initial")∘String, simu.outtype)
 
+    statistics = CEG.MoveStatistics(1.3u"Å", 30.0u"°")
+    swap_statistics = zero(MVector{4,Int})
+    Π = prod(gmc.num_unitcell)
+
+
     if simu.ninit == 0
         # put!(output, startstep)
         push!(energies, energy)
@@ -388,16 +450,11 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
         push!(initial_energies, energy)
     end
 
-    statistics = CEG.MoveStatistics(1.3u"Å", 30.0u"°")
-    swap_statistics = zero(MVector{4,Int})
-
     P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
     PV_div_k = uconvert(u"K", P*gmc.volume/u"k")
     φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, T0; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, T0)))
     isnan(φ) && error("Specified gas not in gas form at the required temperature ($(first(simu.temperatures))) and pressure ($P)!")
     φPV_div_k = φ*PV_div_k
-
-    Π = prod(gmc.num_unitcell)
 
     for (counter_cycle, idx_cycle) in enumerate((-simu.ninit+1):simu.ncycles)
         temperature = simu.temperatures[counter_cycle]
