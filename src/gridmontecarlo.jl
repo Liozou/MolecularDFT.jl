@@ -140,40 +140,66 @@ function precompute_interactions(setup::CEG.CrystalEnergySetup, ff_∞::CEG.Forc
         buffer, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
         safemin2 = safemin^2
         buffer2 = MVector{3,Float64}(undef)
+        # last_j is the last j such that distj < cutoff2, and then
+        # first_j is the first j such that distj < cutoff2
         last_j = first_j = 0
         values_j = Tuple{Int,Vector{Float64}}[]
+        # last_distj and increasing_distj are used for the case where there is no gap
+        # between last_j and first_j (and idem for i below)
+        last_distj = NaN
+        increasing_distj = false
         for j in 1:b
             buffer .= mat[:,3].*((k-1)/c) .+ mat[:,2].*((j-1)/b)
             col = SVector{3,Float64}(buffer)
-            startdist = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
-            if last_j == 0 && startdist ≥ cutoff2
-                last_j = j-1
-            elseif last_j != 0 && first_j == 0 && startdist < cutoff2
+            distj = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
+            if !increasing_distj && !isnan(last_distj) && last_distj < distj
+                increasing_distj = true
+            end
+            if last_j == 0
+                if distj ≥ cutoff2
+                    last_j = j-1
+                elseif increasing_distj && distj ≤ last_distj
+                    last_j = j-1
+                    first_j = j
+                end
+            elseif last_j != 0 && first_j == 0 && distj < cutoff2
                 first_j = j
             end
-            if startdist < cutoff2
-                @assert last_j == 0 || first_j != 0
+            if distj < cutoff2
+                @assert last_j == 0 || first_j != 0 || (increasing_distj && last_j == first_j-1)
             else
                 @assert last_j != 0 && first_j == 0
             end
-            startdist < cutoff2 || continue
+            last_distj = distj
+            distj < cutoff2 || continue
             values_i = Float64[]
             last_i = first_i = 0
+            last_disti = NaN
+            increasing_disti = false
             for i in 1:a
                 buffer .= col .+ mat[:,1].*((i-1)/a)
-                dist2 = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
-                if last_i == 0 && dist2 ≥ cutoff2
-                    last_i = i-1
-                elseif last_i != 0 && first_i == 0 && dist2 < cutoff2
+                disti = CEG.periodic_distance2_fromcartesian!(buffer, mat, invmat, ortho, safemin2, buffer2)
+                if !increasing_distj && !isnan(last_distj) && last_distj < distj
+                    increasing_distj = true
+                end
+                if last_i == 0
+                    if disti ≥ cutoff2
+                        last_i = i-1
+                    elseif increasing_disti && disti ≤ last_disti
+                        last_i = i-1
+                        first_i = i
+                    end
+                elseif last_i != 0 && first_i == 0 && disti < cutoff2
                     first_i = i
                 end
-                if dist2 < cutoff2
-                    @assert last_i == 0 || first_i != 0
+                if disti < cutoff2
+                    @assert last_i == 0 || first_i != 0 || (increasing_disti && last_i == first_i-1)
                 else
                     @assert last_i != 0 && first_i == 0
                 end
-                dist2 < cutoff2 || continue
-                push!(values_i, interp(sqrt(dist2)))
+                last_disti = disti
+                disti < cutoff2 || continue
+                push!(values_i, interp(sqrt(disti)))
             end
             circshift!(values_i, -last_i)
             midi = first_i ≤ 1 ? 1 : a + 2 - first_i
@@ -318,7 +344,7 @@ function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos:
 end
 all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, grid, 0, insertion_pos)
 
-function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3})
+function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3}=dropdims(minimum(gmc.egrid; dims=1); dims=1))
     framework = 0.0
     energy = 0.0
     a,b,c = size(grid)
@@ -333,11 +359,10 @@ function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3})
     GridMCEnergyReport(framework*u"K", energy*u"K", tailcorrection)
 end
 
-function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, idx)
+function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, idx, r=(isnothing(idx) ? 1.0 : rand()))
     if idx isa Nothing
         movekind = :random_translation
     else
-        r = rand()
         movekind = gmc.moves(r)
         CEG.attempt!(statistics, movekind)
         x, y, z = gmc.positions[idx]
@@ -347,7 +372,7 @@ function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, id
     for _ in 1:100
         u, v, w = newpos = if movekind === :translation
             (mod1(rand(x-2:x+2), α), mod1(rand(y-2:y+2), β), mod1(rand(z-2:z+2), γ))
-        elseif movekind === :random_translation
+        elseif movekind === :random_translation || movekind === :random_reinsertion
             (rand(1:α), rand(1:β), rand(1:γ))
         else
             error(lazy"Unknown move kind: $movekind")
@@ -356,8 +381,12 @@ function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, id
             return newpos, movekind, false
         end
     end
+    # failed to find a suitable move
+    if movekind === :translation
+        return choose_newpos!(statistics, gmc, grid, idx, 1.0)
+    end
     @warn "Trapped species did not manage to move out of a blocked situation. This could be caused by an impossible initial configuration."
-    return pos, movekind, true # signal that the move was blocked
+    return idx, movekind, true # signal that the move was blocked
 end
 
 choose_newpos(gmc::GridMCSetup, grid::Array{Float64,3}) = choose_newpos!(nothing, gmc, grid, nothing)
@@ -493,6 +522,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
                 gmc.positions[idx] = newpos
                 CEG.accept!(statistics, move)
                 if abs(Number(diff)) > 1e50u"K" # an atom left a blocked pocket
+                    @warn "Unexpected energy difference for pressure $pressure"
                     energy = baseline_energy(gmc, grid) # to avoid underflows
                 else
                     energy += diff
