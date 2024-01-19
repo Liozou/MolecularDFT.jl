@@ -256,7 +256,7 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
 end
 
 
-function CEG.ProtoSimulationStep(gmc::GridMCSetup)
+function CEG.ProtoSimulationStep(gmc::GridMCSetup, gmcpositions=gmc.positions)
     # GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
     ff = CEG.parse_forcefield_RASPA(gmc.input[2])
     framework = CEG.load_framework_RASPA(gmc.input[1], gmc.input[2])
@@ -266,7 +266,7 @@ function CEG.ProtoSimulationStep(gmc::GridMCSetup)
 
     refpos = position(molecule)::Vector{SVector{3,typeof(1.0u"Å")}}
     m = length(molecule)
-    n = length(gmc.positions)
+    n = length(gmcpositions)
 
     mat = uconvert.(u"Å", stack(gmc.num_unitcell.*bounding_box(framework)))
 
@@ -288,7 +288,7 @@ function CEG.ProtoSimulationStep(gmc::GridMCSetup)
     buffer = MVector{3,typeof(1.0u"Å")}(undef)
     ofs = MVector{3,typeof(1.0u"Å")}(undef)
     for idx in 1:n
-        i, j, k = gmc.positions[idx]
+        i, j, k = gmcpositions[idx]
         ofs .= (@view mat[:,1]).*((i-1)/a) .+ (@view mat[:,2]).*((j-1)/b) .+ (@view mat[:,3]).*((k-1)/c)
         l = (idx-1)*m
         rot = rots[findmin(@view gmc.egrid[:, mod1(i, _a), mod1(j, _b), mod1(k, _c)])[2]]
@@ -447,7 +447,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
     @assert allequal(simu.temperatures)
     T0 = first(simu.temperatures)
-    grid = CEG.meanBoltzmann(gmc.egrid, ustrip(u"K", T0))
+    grid = CEG.meanBoltzmann(gmc.egrid, ustrip(u"K", T0), CEG.get_lebedev_direct(size(gmc.egrid, 1)).weights)
     # grid = dropdims(minimum(gmc.egrid; dims=1); dims=1)
     # TODO: decide whether to keep Boltzmann or minimum
 
