@@ -413,7 +413,7 @@ function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, Ï
     newenergy = GridMCEnergyReport()
     for swap_retries in 1:10
         N = length(gmc.positions)
-        isinsertion = N == 0 ? true : rand(Bool)
+        isinsertion = rand(Bool)
         diff_swap = if isinsertion
             insertion_attempts += 1
             insertion_pos, _, blocked_insertion = choose_newpos(gmc, grid)
@@ -421,6 +421,7 @@ function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, Ï
             all_interactions(gmc, grid, insertion_pos)
         else # deletion
             deletion_attempts += 1
+            N == 0 && continue
             idx_delete = rand(1:N)
             -all_interactions(gmc, grid, idx_delete, gmc.positions[idx_delete])
         end
