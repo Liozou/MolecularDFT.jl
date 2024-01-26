@@ -5,18 +5,17 @@ using Base.Threads: @threads
 using LinearAlgebra: det, norm
 
 # Compact sparse array used to represent the interactions between two identical species
-struct CentroSymmetricTensor{T} <: AbstractArray{T,3}
+struct CentroSymmetricTensor{T}
     data::Vector{T}
     inds::Matrix{NTuple{3,Int}}
     default::T
     size::NTuple{3,Int}
 end
-Base.size(x::CentroSymmetricTensor) = x.size
-Base.@propagate_inbounds function Base.getindex(x::CentroSymmetricTensor, i::Int, j::Int, k::Int)
+Base.@propagate_inbounds function Base.getindex(x::CentroSymmetricTensor, i1::Integer, j1::Integer, k1::Integer, i2::Integer, j2::Integer, k2::Integer)
     a, b, c = x.size
-    @boundscheck if (i<1)|(j<1)|(k<1)|(i>a)|(j>b)|(k>c)
-        throw(BoundsError(x, (i,j,k)))
-    end
+    i = mod1(1+i1-i2, a)
+    j = mod1(1+j1-j2, b)
+    k = mod1(1+k1-k2, c)
     dj, dk = size(x.inds)
     if k > dk
         k = 1 + (k!=1)*(c+1-k)
@@ -212,6 +211,73 @@ function precompute_interactions(setup::CEG.CrystalEnergySetup, ff_∞::CEG.Forc
     CentroSymmetricTensor(interactions_data, (a,b,c), 0.0)
 end
 
+struct ExplicitAngleInteraction
+    mat::SMatrix{3,3,typeof(1.0u"Å"),9}
+    invmat::SMatrix{3,3,typeof(1.0u"Å^-1"),9}
+    minangles::Array{Int,3}
+    gridsize::NTuple{3,Int}
+    molposs::Vector{Vector{SVector{3,typeof(1.0u"Å")}}}
+    ffidxi::Vector{Int}
+    ff::CEG.ForceField
+    buffer::MVector{3,typeof(1.0u"Å")}
+    buffer2::MVector{3,Float64}
+    ortho::Bool
+    safemin2::typeof(1.0u"Å^2")
+end
+function ExplicitAngleInteraction(mol::AbstractSystem{3}, ff::CEG.ForceField, egrid::Array{Float64,4}, mat::AbstractMatrix, gridsize::NTuple{3,Int})
+    minangles = argmin.(eachslice(egrid; dims=(2,3,4), drop=true))::Array{Int,3}
+    poss0 = position(mol)::Vector{SVector{3,typeof(1.0u"Å")}}
+    rots = CEG.get_rotation_matrices(mol, size(egrid, 1), true)[1]
+    molposs = [[SVector{3}(r*p) for p in poss0] for r in rots]
+    ffidxi = [ff.sdict[CEG.atomic_symbol(mol, k)]::Int for k in 1:length(mol)]
+    buffer2, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
+    buffer = MVector{3,typeof(1.0u"Å")}(undef)
+    invmat = inv(mat).*u"Å^-1"
+    ExplicitAngleInteraction(mat.*u"Å", invmat, minangles, gridsize, molposs, ffidxi, ff, buffer, buffer2, ortho, (safemin*u"Å")^2)
+end
+function Base.getindex(eai::ExplicitAngleInteraction, i1::Integer, j1::Integer, k1::Integer, i2::Integer, j2::Integer, k2::Integer)
+    A, B, C = size(eai.minangles)
+    l1 = eai.minangles[mod1(i1, A), mod1(j1, B), mod1(k1, C)]
+    l2 = eai.minangles[mod1(i2, A), mod1(j2, B), mod1(k2, C)]
+    pos1 = eai.molposs[l1]
+    pos2 = eai.molposs[l2]
+    a, b, c = eai.gridsize
+    ofs = ((i2-i1)/a)*eai.mat[:,1] + ((j2-j1)/b)*eai.mat[:,2] + ((k2-k1)/c)*eai.mat[:,3]
+    ret = 0.0u"K"
+    for n1 in eachindex(pos1), n2 in eachindex(pos2)
+        eai.buffer .= pos2[n2] .- pos1[n1] .+ ofs
+        d2 = CEG.periodic_distance2_fromcartesian!(eai.buffer, eai.mat, eai.invmat, eai.ortho, eai.safemin2, eai.buffer2)
+        ret += eai.ff[eai.ffidxi[n1], eai.ffidxi[n2]](d2)
+    end
+    ustrip(u"K", ret)
+end
+
+
+struct ExcludedVolumeInteraction
+    mat::SMatrix{3,3,typeof(1.0u"Å"),9}
+    invmat::SMatrix{3,3,typeof(1.0u"Å^-1"),9}
+    gridsize::NTuple{3,Int}
+    radius2::typeof(1.0u"Å^2")
+    buffer::MVector{3,typeof(1.0u"Å")}
+    buffer2::MVector{3,Float64}
+    ortho::Bool
+    safemin2::typeof(1.0u"Å^2")
+end
+function ExcludedVolumeInteraction(mat::AbstractMatrix, gridsize::NTuple{3,Int}, radius2)
+    buffer2, ortho, safemin = CEG.prepare_periodic_distance_computations(mat)
+    safemin2 = safemin^2
+    buffer = MVector{3,typeof(1.0u"Å")}(undef)
+    cell = CEG.CellMatrix(mat)
+    ExcludedVolumeInteraction(cell.mat, cell.invmat, gridsize, radius2, buffer, buffer2, ortho, safemin2)
+end
+function Base.getindex(evi::ExcludedVolumeInteraction, i1::Integer, j1::Integer, k1::Integer, i2::Integer, j2::Integer, k2::Integer)
+    a, b, c = evi.gridsize
+    evi.buffer .= ((i2-i1)/a)*evi.mat[:,1] + ((j2-j1)/b)*evi.mat[:,2] + ((k2-k1)/c)*evi.mat[:,3]
+    d2 = CEG.periodic_distance2_fromcartesian!(evi.buffer, evi.mat, evi.invmat, evi.ortho, evi.safemin2, evi.buffer2)
+    d2 ≤ evi.radius2 && return 1e100
+    0.0
+end
+
 struct GridMCSetup{TModel0,TModel,TInteractions}
     egrid::Array{Float64,4}
     positions::Vector{NTuple{3,Int}}
@@ -235,7 +301,7 @@ function Base.copy(gmc::GridMCSetup)
     GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.tailcorrection, gmc.input, gmc.num_unitcell)
 end
 
-function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
+function GridMCSetup(framework, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
     setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
     egrid = CEG.energy_grid(setup, step)
     # min_angle = findmin(eachslice(egrid; dims=(2,3)))
@@ -248,10 +314,17 @@ function GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasn
     tailcorrection = precompute_tailcorrection(setup, ff, mat, prod(num_unitcell))
 
     abc = num_unitcell .* size(egrid)[2:end]
+    ## one of either...
     interactions = precompute_interactions(setup, ff_∞, ustrip(u"Å", ff.cutoff), mat, abc)
 
+    ## or...
+    # interactions = ExplicitAngleInteraction(setup.molecule, ff_∞, egrid, mat, abc)
+
+    ## or...
+    # interactions = ExcludedVolumeInteraction(mat.*u"Å", abc, (3.8u"Å")^2)
+
     cmoves = moves isa Nothing ? CEG.MCMoves(true) : moves
-    input = (framework::AbstractString, forcefield, gasname, mol_ff)
+    input = (framework isa AbstractString ? framework : "(empty)", forcefield, gasname, mol_ff)
     GridMCSetup(egrid, mat*u"Å", interactions, cmoves, tailcorrection, gasname, input, num_unitcell)
 end
 
@@ -284,12 +357,13 @@ function CEG.ProtoSimulationStep(gmc::GridMCSetup, gmcpositions=gmc.positions)
 
     _, _a, _b, _c = size(gmc.egrid)
     a, b, c = gmc.num_unitcell .* (_a, _b, _c)
+    stepA, stepB, stepC = eachcol(mat) ./ (a,b,c)
     positions = Vector{SVector{3,typeof(1.0u"Å")}}(undef, n*m)
     buffer = MVector{3,typeof(1.0u"Å")}(undef)
     ofs = MVector{3,typeof(1.0u"Å")}(undef)
     for idx in 1:n
         i, j, k = gmcpositions[idx]
-        ofs .= (@view mat[:,1]).*((i-1)/a) .+ (@view mat[:,2]).*((j-1)/b) .+ (@view mat[:,3]).*((k-1)/c)
+        ofs .= stepA.*(i-1) .+ stepB.*(j-1) .+ stepC.*(k-1)
         l = (idx-1)*m
         rot = rots[findmin(@view gmc.egrid[:, mod1(i, _a), mod1(j, _b), mod1(k, _c)])[2]]
         for p in refpos
@@ -326,8 +400,7 @@ Base.:/(x::GridMCEnergyReport, n::Integer) = GridMCEnergyReport(x.framework/n, x
 
 
 function interaction_energy(gmc::GridMCSetup, (i1,j1,k1)::NTuple{3,Int}, (i2,j2,k2)::NTuple{3,Int})
-    a, b, c = size(gmc.interactions)
-    gmc.interactions[mod1(1+i1-i2, a), mod1(1+j1-j2, b), mod1(1+k1-k2, c)]
+    gmc.interactions[i1, j1, k1, i2, j2, k2]
 end
 
 function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos::NTuple{3,Int})
@@ -344,7 +417,14 @@ function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos:
 end
 all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, grid, 0, insertion_pos)
 
-function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3}=dropdims(minimum(gmc.egrid; dims=1); dims=1))
+
+function grid_angle_average(egrid, T0=300.0u"K")
+    CEG.meanBoltzmann(egrid, ustrip(u"K", T0), CEG.get_lebedev_direct(size(egrid, 1)).weights)
+    # dropdims(minimum(egrid; dims=1); dims=1)
+    # TODO: decide whether to keep Boltzmann or minimum
+end
+
+function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3}=grid_angle_average(gmc.egrid))
     framework = 0.0
     energy = 0.0
     a,b,c = size(grid)
@@ -368,7 +448,7 @@ function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, id
         x, y, z = gmc.positions[idx]
     end
     a, b, c = size(grid)
-    α, β, γ = size(gmc.interactions)
+    α, β, γ = gmc.num_unitcell.*(a, b, c)
     for _ in 1:100
         u, v, w = newpos = if movekind === :translation
             (mod1(rand(x-2:x+2), α), mod1(rand(y-2:y+2), β), mod1(rand(z-2:z+2), γ))
@@ -411,7 +491,7 @@ function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, �
     insertion_successes = insertion_attempts = 0
     deletion_successes = deletion_attempts = 0
     newenergy = GridMCEnergyReport()
-    for swap_retries in 1:10
+    for swap_retries in 1:4
         N = length(gmc.positions)
         isinsertion = rand(Bool)
         diff_swap = if isinsertion
@@ -438,7 +518,6 @@ function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, �
                 deletion_successes += 1
             end
         end
-        insertion_attempts-insertion_successes + deletion_attempts-deletion_successes ≥ 2 && insertion_successes + deletion_successes ≥ 2 && break
     end
     (insertion_successes, insertion_attempts, deletion_successes, deletion_attempts), newenergy
 end
@@ -448,9 +527,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
 
     @assert allequal(simu.temperatures)
     T0 = first(simu.temperatures)
-    grid = CEG.meanBoltzmann(gmc.egrid, ustrip(u"K", T0), CEG.get_lebedev_direct(size(gmc.egrid, 1)).weights)
-    # grid = dropdims(minimum(gmc.egrid; dims=1); dims=1)
-    # TODO: decide whether to keep Boltzmann or minimum
+    grid = grid_angle_average(gmc.egrid, T0)
 
     # energy initialization
     energy = baseline_energy(gmc, grid)
@@ -485,6 +562,8 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
     φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, T0; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, T0)))
     isnan(φ) && error("Specified gas not in gas form at the required temperature ($(first(simu.temperatures))) and pressure ($P)!")
     φPV_div_k = φ*PV_div_k
+
+    # allpositions = [copy(gmc.positions)]
 
     for (counter_cycle, idx_cycle) in enumerate((-simu.ninit+1):simu.ncycles)
         temperature = simu.temperatures[counter_cycle]
@@ -548,6 +627,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
             end
             yield()
         end
+        # push!(allpositions, copy(gmc.positions))
     end
 
     @label end_cleanup
@@ -571,12 +651,19 @@ function make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
     n = length(pressures)
     isotherm = Vector{Float64}(undef, n)
     energies = Vector{GridMCEnergyReport}(undef, n)
+    @assert allequal(simu.temperatures)
+    @info "The number of cycles is multiplied by 1 + 1e3/sqrt(ustrip(u\"Pa\", pressure))"
     @threads for i in 1:n
         newgmc = copy(gmc)
         pressure = pressures[i]
-        es, Ns = run_grid_montecarlo!(newgmc, simu, pressure)
+        P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
+        ncycles = ceil(Int, simu.ncycles*(1+1e3/sqrt(ustrip(u"Pa", P))))
+        temperatures = fill(simu.temperatures[1], ncycles+simu.ninit)
+        newsimu = CEG.SimulationSetup(temperatures, ncycles, simu.ninit, simu.outdir, simu.printevery, simu.outtype, simu.record)
+        es, Ns = run_grid_montecarlo!(newgmc, newsimu, P)
         isotherm[i] = mean(Ns)
         energies[i] = mean(es)
+        @show "Finished $pressure Pa"
     end
     isotherm, energies
 end
