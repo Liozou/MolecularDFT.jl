@@ -647,23 +647,32 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
     energies, Ns./Π
 end
 
-function make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
+function CEG.make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
     n = length(pressures)
     isotherm = Vector{Float64}(undef, n)
     energies = Vector{GridMCEnergyReport}(undef, n)
     @assert allequal(simu.temperatures)
-    @info "The number of cycles is multiplied by 1 + 1e3/sqrt(ustrip(u\"Pa\", pressure))"
+    _mp = minimum(pressures)
+    if (_mp isa Quantity ? _mp : _mp*u"Pa") ≤ 1e4u"Pa"
+        @info "The number of cycles is multiplied by 1 + 1e3/ustrip(u\"Pa\", pressure) to correct for low pressures"
+    end
     @threads for i in 1:n
         newgmc = copy(gmc)
         pressure = pressures[i]
         P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
-        ncycles = ceil(Int, simu.ncycles*(1+1e3/sqrt(ustrip(u"Pa", P))))
+        ncycles = ceil(Int, simu.ncycles*(1+1e3/ustrip(u"Pa", P)))
+        ncycles = simu.ncycles
         temperatures = fill(simu.temperatures[1], ncycles+simu.ninit)
-        newsimu = CEG.SimulationSetup(temperatures, ncycles, simu.ninit, simu.outdir, simu.printevery, simu.outtype, simu.record)
+        newsimu = CEG.SimulationSetup(temperatures, ncycles, simu.ninit, simu.outdir, simu.printevery, simu.printeveryinit, simu.outtype, simu.record)
+        sleep(1)
+        yield()
+        t0 = time()
         es, Ns = run_grid_montecarlo!(newgmc, newsimu, P)
+        t1 = time()
+        Δt = (t1-t0)*u"s"
         isotherm[i] = mean(Ns)
         energies[i] = mean(es)
-        @show "Finished $pressure Pa"
+        println("Finished $P in $Δt")
     end
     isotherm, energies
 end
