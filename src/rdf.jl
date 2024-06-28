@@ -266,14 +266,14 @@ function (f::IncrementalSmoothInterpolator{T})(x) where {T}
     return f.fhigh(x)
 end
 
-function IncrementalSmoothInterpolator(x, y)
+function IncrementalSmoothInterpolator(x, y::Vector)
     midlimit = 1
-    while y[midlimit] == 1e100
+    while midlimit < length(y)-2 && y[midlimit] == 1e100
         midlimit += 1
     end
     inflimit = max(1, midlimit-1)
     λ = x[inflimit]
-    while y[midlimit] > 1e4
+    while midlimit < length(y)-1 && y[midlimit] > 1e4
         midlimit += 1
     end
     flow = if iszero(λ)
