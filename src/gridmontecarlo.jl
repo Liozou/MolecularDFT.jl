@@ -283,25 +283,27 @@ struct GridMCSetup{TModel0,TModel,TInteractions}
     positions::Vector{NTuple{3,Int}}
     volume::typeof(1.0u"Å^3")
     interactions::TInteractions # TODO: replace by the final chosen type, no need to keep a parameter here
-    moves::CEG.MCMoves
+    mcmoves::CEG.MCMoves
     model0::TModel0
     model::TModel
     tailcorrection::NTuple{2,typeof(1.0u"K")} # (amount to add for each additional molecule, amount to add after multiplying by the number of molecules)
     input::NTuple{4,String}
     num_unitcell::NTuple{3,Int}
 end
-function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, moves::CEG.MCMoves, tailcorrection::NTuple{2,typeof(1.0u"K")}, gasname::AbstractString, input::Tuple, num_unitcell::NTuple{3,Int}, positions=NTuple{3,Int}[])
+function GridMCSetup(grid, mat::AbstractMatrix{typeof(1.0u"Å")}, interactions, mcmoves::CEG.MCMoves, tailcorrection::NTuple{2,typeof(1.0u"K")}, gasname::AbstractString, input::Tuple, num_unitcell::NTuple{3,Int}, positions=NTuple{3,Int}[])
     gaskey = get(GAS_NAMES, gasname, gasname)
     accessible_fraction = count(<(1e100), grid) / length(grid)
     volume = accessible_fraction * prod(CEG.cell_lengths(mat))
-    GridMCSetup(grid, positions, volume, interactions, moves, Clapeyron.PR([gaskey]), Clapeyron.GERG2008([gaskey]), tailcorrection, input, num_unitcell)
+    GridMCSetup(grid, positions, volume, interactions, mcmoves, Clapeyron.PR([gaskey]), Clapeyron.GERG2008([gaskey]), tailcorrection, input, num_unitcell)
 end
 
 function Base.copy(gmc::GridMCSetup)
-    GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.moves, gmc.model0, gmc.model, gmc.tailcorrection, gmc.input, gmc.num_unitcell)
+    GridMCSetup(gmc.egrid, copy(gmc.positions), gmc.volume, gmc.interactions, gmc.mcmoves, gmc.model0, gmc.model, gmc.tailcorrection, gmc.input, gmc.num_unitcell)
 end
 
-function GridMCSetup(framework, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
+CEG.first_species(gmc::GridMCSetup) = gmc.input[3]
+
+function GridMCSetup(framework, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", mcmoves=nothing)
     setup = CEG.setup_RASPA(framework, forcefield, gasname, mol_ff; gridstep=step)
     egrid = CEG.energy_grid(setup, step)
     # min_angle = findmin(eachslice(egrid; dims=(2,3)))
@@ -323,14 +325,14 @@ function GridMCSetup(framework, forcefield::AbstractString, gasname::AbstractStr
     ## or...
     # interactions = ExcludedVolumeInteraction(mat.*u"Å", abc, (3.8u"Å")^2)
 
-    cmoves = moves isa Nothing ? CEG.MCMoves(true) : moves
+    newmcmoves = mcmoves isa Nothing ? CEG.MCMoves(true) : mcmoves
     input = (framework isa AbstractString ? framework : "(empty)", forcefield, gasname, mol_ff)
-    GridMCSetup(egrid, mat*u"Å", interactions, cmoves, tailcorrection, gasname, input, num_unitcell)
+    GridMCSetup(egrid, mat*u"Å", interactions, newmcmoves, tailcorrection, gasname, input, num_unitcell)
 end
 
 
 function CEG.ProtoSimulationStep(gmc::GridMCSetup, gmcpositions=gmc.positions)
-    # GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", moves=nothing)
+    # GridMCSetup(framework::AbstractString, forcefield::AbstractString, gasname::AbstractString, mol_ff::AbstractString, step=0.15u"Å", mcmoves=nothing)
     ff = CEG.parse_forcefield_RASPA(gmc.input[2])
     framework = CEG.load_framework_RASPA(gmc.input[1], gmc.input[2])
     molecule = CEG.load_molecule_RASPA(gmc.input[3], gmc.input[4], gmc.input[2], framework)
@@ -415,7 +417,6 @@ function all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, l::Int, pos:
     tailcorrection = gmc.tailcorrection[1] + gmc.tailcorrection[2]*(2n+1)
     GridMCEnergyReport(grid[mod1(i,a),mod1(j,b),mod1(k,c)]*u"K", energy*u"K", tailcorrection)
 end
-all_interactions(gmc::GridMCSetup, grid::Array{Float64,3}, insertion_pos::NTuple{3,Int}) = all_interactions(gmc, grid, 0, insertion_pos)
 
 
 function grid_angle_average(egrid, T0=300.0u"K")
@@ -439,37 +440,42 @@ function baseline_energy(gmc::GridMCSetup, grid::Array{Float64,3}=grid_angle_ave
     GridMCEnergyReport(framework*u"K", energy*u"K", tailcorrection)
 end
 
-function choose_newpos!(statistics, gmc::GridMCSetup, grid::Array{Float64,3}, idx, r=(isnothing(idx) ? 1.0 : rand()))
-    if idx isa Nothing
-        movekind = :random_translation
-    else
-        movekind = gmc.moves(r)
-        CEG.attempt!(statistics, movekind)
-        x, y, z = gmc.positions[idx]
+function choose_step!(statistics, gmc::GridMCSetup, grid::Array{Float64,3})
+    # handle properly the case where there is no molecule
+    idx = isempty(gmc.positions) ? 0 : rand(1:length(gmc.positions))
+    x, y, z = startpos = idx == 0 ? (0,0,0) : gmc.positions[idx]
+    movekind = gmc.mcmoves(rand())
+    if movekind === :swap
+        movekind = ifelse(rand(Bool), :swap_deletion, :swap_insertion)
+        idx = (movekind === :swap_deletion)*idx # make idx 0 for insertion
     end
+
+    # if there is no possible move because there is no molecule, return early
+    idx == 0 && movekind !== :swap_insertion && return 0, startpos, movekind, true
+
+    # mark the attempt in the statistics
+    CEG.attempt!(statistics, movekind)
+
     a, b, c = size(grid)
     α, β, γ = gmc.num_unitcell.*(a, b, c)
-    for _ in 1:100
-        u, v, w = newpos = if movekind === :translation
-            (mod1(rand(x-2:x+2), α), mod1(rand(y-2:y+2), β), mod1(rand(z-2:z+2), γ))
-        elseif movekind === :random_translation || movekind === :random_reinsertion
-            (rand(1:α), rand(1:β), rand(1:γ))
-        else
-            error(lazy"Unknown move kind: $movekind")
-        end
-        if grid[mod1(u,a),mod1(v,b),mod1(w,c)] < 1e100
-            return newpos, movekind, false
-        end
-    end
-    # failed to find a suitable move
     if movekind === :translation
-        return choose_newpos!(statistics, gmc, grid, idx, 1.0)
+        u, v, w = newpos = (mod1(rand(x-2:x+2), α), mod1(rand(y-2:y+2), β), mod1(rand(z-2:z+2), γ))
+        grid[mod1(u,a),mod1(v,b),mod1(w,c)] < 1e100 || return idx, startpos, movekind, true
+        return idx, newpos, movekind, false
+    elseif movekind === :swap_deletion
+        return idx, startpos, movekind, false
+    elseif movekind === :random_translation || movekind === :random_reinsertion || movekind === :swap_insertion
+        for _ in 1:100
+            _u, _v, _w = _newpos = (rand(1:α), rand(1:β), rand(1:γ))
+            if grid[mod1(_u,a),mod1(_v,b),mod1(_w,c)] < 1e100
+                return idx, _newpos, movekind, false
+            end
+        end
+        return idx, startpos, movekind, true
+    else
+        error(lazy"Unknown move kind: $movekind")
     end
-    @warn "Trapped species did not manage to move out of a blocked situation. This could be caused by an impossible initial configuration."
-    return idx, movekind, true # signal that the move was blocked
 end
-
-choose_newpos(gmc::GridMCSetup, grid::Array{Float64,3}) = choose_newpos!(nothing, gmc, grid, nothing)
 
 function compute_accept_move(diff, T)
     diff < zero(diff) && return true
@@ -485,44 +491,8 @@ function compute_accept_move(diff, temperature, φPV_div_k, N, isinsertion::Bool
     end
 end
 
-function perform_swaps!(gmc::GridMCSetup, grid::Array{Float64,3}, temperature, φPV_div_k)
-    idx_delete = 0
-    insertion_pos = (0,0,0)
-    insertion_successes = insertion_attempts = 0
-    deletion_successes = deletion_attempts = 0
-    newenergy = GridMCEnergyReport()
-    for swap_retries in 1:4
-        N = length(gmc.positions)
-        isinsertion = rand(Bool)
-        diff_swap = if isinsertion
-            insertion_attempts += 1
-            insertion_pos, _, blocked_insertion = choose_newpos(gmc, grid)
-            blocked_insertion && continue
-            all_interactions(gmc, grid, insertion_pos)
-        else # deletion
-            deletion_attempts += 1
-            N == 0 && continue
-            idx_delete = rand(1:N)
-            -all_interactions(gmc, grid, idx_delete, gmc.positions[idx_delete])
-        end
-        if compute_accept_move(Number(diff_swap), temperature, φPV_div_k, N, isinsertion)
-            newenergy += diff_swap
-            if isinsertion
-                push!(gmc.positions, insertion_pos)
-                insertion_successes += 1
-            else
-                if idx_delete != length(gmc.positions)
-                    gmc.positions[idx_delete], gmc.positions[end] = gmc.positions[end], gmc.positions[idx_delete]
-                end
-                pop!(gmc.positions)
-                deletion_successes += 1
-            end
-        end
-    end
-    (insertion_successes, insertion_attempts, deletion_successes, deletion_attempts), newenergy
-end
 
-function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressure)
+function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup)
     time_begin = time()
 
     @assert allequal(simu.temperatures)
@@ -541,7 +511,6 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
     has_initial_output = any(startswith("initial")∘String, simu.outtype)
 
     statistics = CEG.MoveStatistics(1.3u"Å", 30.0u"°")
-    swap_statistics = zero(MVector{4,Int})
     Π = prod(gmc.num_unitcell)
 
 
@@ -557,7 +526,7 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
         push!(initial_energies, energy)
     end
 
-    P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
+    P = simu.pressure
     PV_div_k = uconvert(u"K", P*gmc.volume/u"k")
     φ = only(Clapeyron.fugacity_coefficient(gmc.model, P, T0; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, T0)))
     isnan(φ) && error("Specified gas not in gas form at the required temperature ($(first(simu.temperatures))) and pressure ($P)!")
@@ -568,38 +537,46 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
     for (counter_cycle, idx_cycle) in enumerate((-simu.ninit+1):simu.ncycles)
         temperature = simu.temperatures[counter_cycle]
 
-        # φPV_div_k = if constantT
-        #     φ
-        # else
-        #     Clapeyron.fugacity_coefficient!(φ, gmc.model, P, temperature; phase=:stable, vol0=Clapeyron.volume(gmc.model0, P, temperature))
-        # end*PV_div_k
-        swap_statistics_update, energy_update = perform_swaps!(gmc, grid, temperature, φPV_div_k)
-        swap_statistics .+= swap_statistics_update
-        energy += energy_update
-
-        nummol = length(gmc.positions)
-        numsteps = (nummol!=0)*max(20, nummol)
-        for idx_step in 1:numsteps
+        for idx_step in 1:50
             # choose the species on which to attempt a move
-            idx = rand(1:nummol)
-
             # newpos is the position after the trial move
-            newpos, move, blocked = choose_newpos!(statistics, gmc, grid, idx)
+            idx, newpos, move, blocked = choose_step!(statistics, gmc, grid)
 
             # If, despite the multiple attempts, the move is blocked, skip early to the
             # next iteration.
             # The refused move is still taken into account in the statistics.
             blocked && continue
 
-            diff = all_interactions(gmc, grid, idx, newpos) - all_interactions(gmc, grid, idx, gmc.positions[idx])
+            isinsertion = move === :swap_insertion
+            isswap = isinsertion | (move === :swap_deletion)
+            diff = if isswap
+                _x = all_interactions(gmc, grid, idx, newpos)
+                ifelse(isinsertion, _x, -_x)
+            else
+                all_interactions(gmc, grid, idx, newpos) - all_interactions(gmc, grid, idx, gmc.positions[idx])
+            end
 
-            accepted = compute_accept_move(Number(diff), temperature)
+            accepted = if isswap
+                compute_accept_move(Number(diff), temperature, φPV_div_k, length(gmc.positions), isinsertion)
+            else
+                compute_accept_move(Number(diff), temperature)
+            end
+
             if accepted
                 if Float64(diff) ≥ 1e100
                     @show Number(diff)
                     error("$idx, $newpos")
                 end
-                gmc.positions[idx] = newpos
+                if isinsertion
+                    push!(gmc.positions, newpos)
+                elseif isswap
+                    if idx != length(gmc.positions)
+                        gmc.positions[idx], gmc.positions[end] = gmc.positions[end], gmc.positions[idx]
+                    end
+                    pop!(gmc.positions)
+                else
+                    gmc.positions[idx] = newpos
+                end
                 CEG.accept!(statistics, move)
                 if abs(Number(diff)) > 1e50u"K" # an atom left a blocked pocket
                     @warn "Unexpected energy difference for pressure $pressure"
@@ -637,44 +614,49 @@ function run_grid_montecarlo!(gmc::GridMCSetup, simu::CEG.SimulationSetup, press
     end
     time_end = time()
     CEG.print_report(simu, time_begin, time_end, statistics)
-    open(joinpath(simu.outdir, "report.txt"), "a") do io
-        tot_swap = sum(swap_statistics)
-        println(io, "Accepted swap moves: ", swap_statistics[1] + swap_statistics[3], '/', tot_swap, " (attempted) = ", (swap_statistics[1]+swap_statistics[3])/tot_swap, " among which:")
-        println(io, " - accepted insertion", swap_statistics[1]>1 ? "s: " : ": ", swap_statistics[1], '/', swap_statistics[2], " (attempted) = ", swap_statistics[1]/swap_statistics[2])
-        println(io, " - accepted deletion", swap_statistics[3]>1 ? "s: " : ": ", swap_statistics[3], '/', swap_statistics[4], " (attempted) = ", swap_statistics[3]/swap_statistics[4])
-        println(io)
-    end
     energies, Ns./Π
+end
+
+function CEG.run_gcmc!(gmc::GridMCSetup, simu::CEG.SimulationSetup)
+    mcmoves = gmc.mcmoves
+    if iszero(mcmoves[:swap])
+        iswap = findfirst(==(:swap), CEG.mcmovenames)
+        newmcmoves = CEG.MCMoves(ntuple(i -> i < iswap ? mcmoves.cumulatives[i]*2/3 : mcmoves.cumulatives[i], Val(length(CEG.mcmovenames)-1))) # make swap probability 1/3
+        gmc = GridMCSetup(gmc.egrid, gmc.positions, gmc.volume, gmc.interactions, newmcmoves, gmc.model0, gmc.model, gmc.tailcorrection, gmc.input, gmc.num_unitcell)
+    end
+    printstyled("Running GCMC on species ", CEG.first_species(gmc), " at pressure ", simu.pressure, '\n'; color=:green)
+    run_grid_montecarlo!(gmc, simu)
 end
 
 function CEG.make_isotherm(gmc::GridMCSetup, simu::CEG.SimulationSetup, pressures)
     n = length(pressures)
     isotherm = Vector{Float64}(undef, n)
-    energies = Vector{GridMCEnergyReport}(undef, n)
+    loadings = Vector{Vector{Float64}}(undef, n)
+    energies = Vector{Vector{GridMCEnergyReport}}(undef, n)
     @assert allequal(simu.temperatures)
     _mp = minimum(pressures)
     if (_mp isa Quantity ? _mp : _mp*u"Pa") ≤ 1e4u"Pa"
-        @info "The number of cycles is multiplied by 1 + 1e3/ustrip(u\"Pa\", pressure) to correct for low pressures"
+        @info "The number of cycles is multiplied by 1 + 5e2/ustrip(u\"Pa\", pressure) to correct for low pressures"
     end
     @threads for i in 1:n
         newgmc = copy(gmc)
         pressure = pressures[i]
         P = pressure isa Quantity ? uconvert(u"Pa", pressure) : pressure*u"Pa"
-        ncycles = ceil(Int, simu.ncycles*(1+1e3/ustrip(u"Pa", P)))
-        ncycles = simu.ncycles
+        ncycles = ceil(Int, simu.ncycles*(1+5e2/ustrip(u"Pa", P)))
         temperatures = fill(simu.temperatures[1], ncycles+simu.ninit)
-        newsimu = CEG.SimulationSetup(temperatures, ncycles, simu.ninit, simu.outdir, simu.printevery, simu.printeveryinit, simu.outtype, simu.record)
+        newsimu = CEG.SimulationSetup(temperatures, P, ncycles, simu.ninit, simu.outdir, simu.printevery, simu.printeveryinit, simu.outtype, simu.record)
         sleep(1)
         yield()
         t0 = time()
-        es, Ns = run_grid_montecarlo!(newgmc, newsimu, P)
+        es, Ns = CEG.run_gcmc!(newgmc, newsimu)
         t1 = time()
         Δt = (t1-t0)*u"s"
         isotherm[i] = mean(Ns)
-        energies[i] = mean(es)
+        loadings[i] = Ns
+        energies[i] = es
         println("Finished $P in $Δt")
     end
-    isotherm, energies
+    isotherm, loadings, energies
 end
 
 # using Statistics: std
